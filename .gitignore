@@ -5,3 +5,10 @@ __pycache__/
 .env
 .DS_Store
 frontend/.env*
+
+# committed by mistake — a full virtualenv was tracked
+.venv/
+backend/.venv/
+__pycache__/
+*.pyc
+.DS_Store
