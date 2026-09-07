@@ -1,9 +1,12 @@
 # Relay
 
-A hosted webhook inspector: you create a throwaway `/hooks/{uuid}` URL, anything POSTed to it is stored in Postgres and pushed to the browser over a WebSocket, and you can replay any captured request to another URL with automatic retries on failure.
+A hosted webhook inspector: you create a throwaway `/hooks/{uuid}` URL, anything POSTed to it is stored in Postgres and pushed to the browser over a WebSocket, and you can replay captured requests to an allowed destination URL. Failed replays can be queued for automatic retries when a retry worker is running.
 
 **Status:** prototype
-**Live:** https://webhook-inspector-sx1y.onrender.com serves the frontend and returns 200. It's a static site only — the API it talks to is a separate Render service, and that URL doesn't appear anywhere in the repo; it's only recoverable from the compiled JS bundle.
+**Live frontend:** https://webhook-inspector-sx1y.onrender.com
+**API:** https://webhook-inspector-api.onrender.com — health: https://webhook-inspector-api.onrender.com/health
+
+The frontend is a separate static site. Its compiled bundle points to this API; the September 7 check confirmed frontend assets were reachable and API health reported PostgreSQL and Redis healthy. Those checks do not establish the complete capture/live-feed/replay workflow or retry-worker operation.
 
 ## The problem
 
@@ -48,7 +51,7 @@ cd frontend && npm install && npm run dev   # Vite on :5173
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL` | Required, no default. Must resolve to an async driver — the code rewrites plain `postgresql://`/`psycopg` URLs to `postgresql+asyncpg://` and force-enables SSL for any host containing `neon.tech`. |
-| `REDIS_URL` | Pub/sub for the live feed and the retry queue. Defaults to `redis://localhost:6379` — a typo'd value falls back silently instead of failing. |
+| `REDIS_URL` | Pub/sub for the live feed and the retry queue. Defaults to `redis://localhost:6379` only when the variable is absent. A supplied value is passed to the Redis client; an invalid URL or unreachable host can fail rather than falling back. |
 | `ALLOWED_ORIGINS` | CORS origins, comma-separated. Defaults to the two local Vite ports. Must be set to the real frontend origin in production. |
 | `DEBUG` | Optional. Turns on SQLAlchemy statement logging, which logs captured webhook bodies. Off in the Render deploy. |
 | `VITE_API_URL` | Frontend build-time only, baked into the bundle. Defaults to `localhost:8000`. No `.env.example` exists for the frontend. |
@@ -60,20 +63,20 @@ cd backend
 DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost/webhookinspector_test REDIS_URL=redis://localhost:6379 python -m pytest tests/ -v
 ```
 
-Requires a live Postgres — `conftest.py` builds a real engine and only Redis is mocked. This is the command CI actually runs. A frontend vitest suite exists (`frontend/src/utils.test.ts`) but nothing in CI invokes it, and eslint is configured but never run either.
+Requires a live Postgres — `conftest.py` builds a real engine and mocks the app Redis client. Replay tests also mock outbound HTTP calls, and worker tests mock their database/session dependencies. This is the command CI actually runs. A frontend vitest suite exists (`frontend/src/utils.test.ts`) but nothing in CI invokes it, and eslint is configured but never run either.
 
 ## Known limitations
 
-- **The retry worker isn't deployed.** `render.yaml` runs only `uvicorn app:app`. Nothing starts `worker.py` in production, so every failed or 5xx replay on the live site writes into the Redis `retry_queue` and nothing ever consumes it. The queue is write-only in prod and grows.
+- **Retry-worker deployment is unverified.** `render.yaml` defines the API service and does not start `worker.py`. A separately configured worker was not checked. Failed replays enqueue jobs, but those jobs are processed only if a worker is running; the blueprint alone cannot establish the live worker status.
 - **Replay forwards Authorization and Cookie headers to whatever URL you type.** `security.sanitize_headers` only strips hop-by-hop headers; `test_app.py:259` explicitly asserts `Authorization: Bearer token` survives a replay. Replay a real signed webhook to a URL you don't control and you've handed over that provider's credentials.
-- **The retry queue drops jobs on crash.** `zpopmin` then re-`zadd` has no acknowledgement or in-flight set — a worker killed between pop and re-add (or completed replay) silently loses the job. Two workers would also duplicate work on the same jobs.
+- **The retry queue drops jobs on crash.** `zpopmin` then re-`zadd` has no acknowledgement or in-flight set — a worker killed between pop and re-add (or completed replay) silently loses the job. `zpopmin` removes members atomically, so two workers do not necessarily claim the same queued member. The demonstrated design concern is loss of popped jobs without acknowledgement or recovery.
 - **The public demo shares one session across every visitor.** `Demo.tsx:4` hardcodes a single `DEMO_SESSION` string for the whole landing page, so every browser that loads it can read every other visitor's demo endpoints and payloads. It also creates a fresh endpoint per mount and fires a synthetic webhook every 3.5s; cleanup is a best-effort DELETE on unmount that doesn't run if the tab is just closed, so abandoned tabs leave orphaned endpoints and rows behind permanently.
 - **No data retention.** No TTL, no pruning job, no size cap on `captured_requests` or `delivery_attempts`; full response bodies are stored on every replay attempt. This grows until a free-tier database fills up.
-- **The session ID has no security properties.** Any client-supplied string 16+ characters long is accepted — no signature, no server record, no expiry. Anyone who learns a session ID has full read/delete on it. Clearing `localStorage` permanently orphans that session's data with no recovery.
+- **Session scoping is bearer-token access control, not user-account authentication.** The frontend generates a random UUID and the query layer checks it against the session stored on endpoints. The header accepts any supplied string of 16+ characters, with no signature, rotation or expiry. Anyone who learns a session ID can access that session's data; losing it leaves no built-in account-recovery path. The public landing demo deliberately uses a shared session.
 - **Idle WebSockets leak Redis connections.** A client disconnect is only noticed when the next `send_text` fails, which only happens when a new webhook arrives on that channel — an endpoint whose viewer closed the tab keeps its pubsub subscription open indefinitely. No ping/keepalive, no connection cap.
 - **SSRF check has a TOCTOU window.** `validate_destination_url` resolves the hostname once; `httpx` resolves it again independently for the actual request. A DNS record that changes in between (rebinding) bypasses the blocklist. Redirect-based bypass happens to be closed because `httpx` doesn't follow redirects by default — that's incidental, not enforced.
-- **`/health` fails the whole API on a Redis blip**, even though capture itself degrades gracefully when the pub/sub publish fails — `render.yaml` points its health check straight at `/health`.
-- **`status_code` and `duration_ms` are stored as strings**, not integers, so `_should_retry` has to `int()`-cast a column and there's no way to aggregate attempt latency in SQL.
+- **`/health` returns 503 if PostgreSQL or Redis checks fail.** A failed Redis health check does not mean every API route fails: capture catches pub/sub publication errors after saving the request. `render.yaml` uses `/health`, so hosting health decisions can still be affected.
+- **`status_code` and `duration_ms` are stored as strings**, not integers, so `_should_retry` has to `int()`-cast a column and SQL latency aggregation requires an explicit numeric cast and handling non-numeric values.
 - **A malformed `Content-Length` header 500s instead of 400s** — `flows.capture_webhook` does an unguarded `int()` on it.
 - **Rate limiting is in-memory and resets on every deploy.** Only endpoint creation, capture, and replay are limited; reads and the WebSocket are not, and the UI polls `/attempts` every 5 seconds per selected request.
 - **The HMAC happy path is untested.** There's a test for a rejected signature, none for an accepted one — the branch that would catch an encoding bug is uncovered.
@@ -83,7 +86,7 @@ Requires a live Postgres — `conftest.py` builds a real engine and only Redis i
 
 ## What I'd build next
 
-- Add the worker as a second Render service (`type: worker`, `startCommand: python worker.py`) so the retry path that's already written and tested actually runs in production. This is the biggest gap between the code and the deployment.
+- Verify whether a retry worker is configured separately. If absent and automatic retries are required, add it as a second Render service (`type: worker`, `startCommand: python worker.py`) and verify delivery; do not infer deployment status from the blueprint alone.
 - Strip `Authorization`/`Cookie`/`x-api-key` from replay by default, with an explicit opt-in checkbox or header allowlist in the UI, instead of forwarding credentials by default.
-- Add retention: a TTL or periodic delete on `captured_requests` older than N hours, plus a per-endpoint row cap. The public demo is actively filling the database right now.
+- Add retention: a TTL or periodic delete on `captured_requests` older than N hours, plus a per-endpoint row cap. While mounted and connected, the public demo generates synthetic captures; current database growth was not measured.
 - Make the retry queue crash-safe — an in-flight set removed only after the attempt persists, or a Redis Stream with a consumer group instead of a sorted set. Add an `attempt_number` column to `delivery_attempts` so history shows which retry produced which result.
